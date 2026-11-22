@@ -9,6 +9,8 @@ export type Item = {
   image: string;
   content: string;
   date: string;
+  /** Titel kwam niet uit zichtbare tekst maar uit bijv. een alt-tekst. */
+  weakTitle?: boolean;
 };
 
 export type Candidate = { selector: string; count: number; samples: string[] };
@@ -84,16 +86,28 @@ function selectorFor(a: Element): string {
   return parts.join(" > ");
 }
 
-function titleOf(a: Element): string {
+/** Zichtbare kop of linktekst. Leeg bij een link met alleen een afbeelding. */
+function strongTitle(a: Element): string {
   const h = a.querySelector("h1,h2,h3,h4,h5,h6");
+  return clean(h?.textContent) || clean(a.textContent);
+}
+
+/** Noodtitel uit attributen; een alt-tekst beschrijft vaak de foto, niet het artikel. */
+function weakTitle(a: Element): string {
   return (
-    clean(h?.textContent) ||
-    clean(a.textContent) ||
     clean(a.getAttribute("aria-label")) ||
     clean(a.getAttribute("title")) ||
     clean(a.querySelector("img")?.getAttribute("alt"))
   );
 }
+
+function titleOf(a: Element): string {
+  return strongTitle(a) || weakTitle(a);
+}
+
+/** Link die alleen voor de vorm is: verborgen voor schermlezers of zonder zichtbare tekst. */
+const isDecorative = (a: Element) =>
+  a.getAttribute("aria-hidden") === "true" || a.getAttribute("tabindex") === "-1" || !strongTitle(a);
 
 const sameSite = (a: URL, b: URL) =>
   a.hostname.replace(/^www\./, "") === b.hostname.replace(/^www\./, "");
@@ -110,16 +124,20 @@ function linkOf(a: Element, base: URL): URL | null {
 }
 
 export function detectCandidates(document: Document, base: URL): Candidate[] {
-  const groups = new Map<string, { links: Map<string, string>; chrome: number; total: number }>();
+  const groups = new Map<
+    string,
+    { links: Map<string, string>; chrome: number; decorative: number; total: number }
+  >();
 
   document.querySelectorAll("a[href]").forEach((a) => {
     const u = linkOf(a, base);
     if (!u) return;
     const sel = selectorFor(a);
     let g = groups.get(sel);
-    if (!g) groups.set(sel, (g = { links: new Map(), chrome: 0, total: 0 }));
+    if (!g) groups.set(sel, (g = { links: new Map(), chrome: 0, decorative: 0, total: 0 }));
     g.total++;
     if (a.closest("nav,footer,header,aside,[role=navigation]")) g.chrome++;
+    if (isDecorative(a)) g.decorative++;
     const title = titleOf(a);
     if (!g.links.has(u.href) || title.length > (g.links.get(u.href) ?? "").length) {
       g.links.set(u.href, title);
@@ -142,7 +160,9 @@ export function detectCandidates(document: Document, base: URL): Candidate[] {
         return segs.length >= 2 || last.includes("-") || last.length > 20;
       }).length / n;
     const chromePenalty = g.chrome / g.total > 0.5 ? 0.15 : 1;
-    const score = Math.min(n, 25) * lenScore * (0.4 + slugShare) * chromePenalty;
+    // Fotolinks verliezen van de koplinks naar dezelfde artikelen.
+    const decorPenalty = g.decorative / g.total > 0.5 ? 0.25 : 1;
+    const score = Math.min(n, 25) * lenScore * (0.4 + slugShare) * chromePenalty * decorPenalty;
     scored.push({ selector, count: n, samples: titles.slice(0, 2), score });
   }
   scored.sort((a, b) => b.score - a.score);
@@ -182,9 +202,15 @@ function extractList(document: Document, base: URL, selector: string): Item[] {
       if (inside.size > 1 || p.localName === "body") break;
       card = p;
     }
-    const title = titleOf(a) || clean(card.querySelector("h1,h2,h3,h4")?.textContent);
+    // Zichtbare kop gaat voor; daarna de kop in de kaart; alt-tekst pas als laatste.
+    const visible = strongTitle(a) || clean(card.querySelector("h1,h2,h3,h4,h5,h6")?.textContent);
+    const title = visible || weakTitle(a);
+    const weak = !visible;
     const prev = items.get(link);
-    if (prev && prev.title.length >= title.length) continue;
+    // Een zichtbare kop wint altijd van een alt-tekst, ook als die langer is.
+    if (prev && (weak && !prev.weakTitle || (weak === Boolean(prev.weakTitle) && prev.title.length >= title.length))) {
+      continue;
+    }
     const intro = [...card.querySelectorAll("p")]
       .map((p) => clean(p.textContent))
       .find((t) => t.length > 30 && t !== title);
@@ -195,6 +221,7 @@ function extractList(document: Document, base: URL, selector: string): Item[] {
       image: imgSrc(card.querySelector("img"), base),
       content: "",
       date: "",
+      weakTitle: weak,
     });
   }
   return [...items.values()].filter((i) => i.title).slice(0, MAX_ITEMS);
@@ -234,6 +261,48 @@ function toIso(s: string | null | undefined): string {
   return isNaN(d.getTime()) ? "" : d.toISOString();
 }
 
+const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+
+/** Haalt " | Sitenaam" van het eind van een paginatitel. */
+const stripSite = (s: string) => s.replace(/\s+[|·–—-]\s+[^|·–—-]{2,40}$/, "").trim();
+
+/**
+ * Zichtbare kop van de artikelpagina. Volgorde:
+ * 1. een h1 die (grotendeels) gelijk is aan og:title of <title> zonder sitenaam;
+ * 2. de enige inhouds-h1, of die in <article>/<main>;
+ * 3. og:title zonder sitenaam (soms een SEO-titel, daarom pas als laatste).
+ * Logo-koppen in de header, het menu of een link tellen niet mee.
+ */
+function headlineOf(document: Document, ogTitle: string): string {
+  const refs = [stripSite(ogTitle), stripSite(clean(document.querySelector("title")?.textContent))]
+    .map(norm)
+    .filter((r) => r.length >= 10);
+
+  const content: { text: string; inArticle: boolean }[] = [];
+  for (const h of document.querySelectorAll("h1")) {
+    const header = h.closest("header");
+    if ((header && !header.closest("article,main")) || h.closest("nav,a")) continue;
+    if (/logo|brand|site-title/i.test(h.getAttribute("class") ?? "")) continue;
+    const text = clean(h.textContent);
+    if (norm(text).length < 10 || text.length > 250) continue;
+    content.push({ text, inArticle: Boolean(h.closest("article,main")) });
+  }
+
+  const matching = content.filter(({ text }) => {
+    const n = norm(text);
+    return refs.some(
+      (r) => (r.includes(n) && n.length >= r.length * 0.6) || (n.includes(r) && r.length >= n.length * 0.6),
+    );
+  });
+  if (matching.length) return matching.sort((a, b) => b.text.length - a.text.length)[0].text;
+  if (content.length === 1) return content[0].text;
+  const inArticle = content.filter((c) => c.inArticle);
+  if (inArticle.length === 1) return inArticle[0].text;
+
+  const og = stripSite(ogTitle);
+  return og.length >= 10 ? og : "";
+}
+
 async function enrich(item: Item): Promise<Item> {
   try {
     const { html, url } = await fetchHtml(item.link, 8000);
@@ -254,7 +323,7 @@ async function enrich(item: Item): Promise<Item> {
       toIso(document.querySelector("time[datetime]")?.getAttribute("datetime"));
     const image = abs(meta("og:image", "twitter:image"), url) || item.image;
     const description = meta("og:description", "description", "twitter:description");
-    const pageTitle = clean(document.querySelector("h1")?.textContent) || meta("og:title");
+    const headline = headlineOf(document, meta("og:title"));
 
     let content = "";
     let excerpt = "";
@@ -270,7 +339,9 @@ async function enrich(item: Item): Promise<Item> {
 
     return {
       ...item,
-      title: item.title.length >= 15 ? item.title : pageTitle || item.title,
+      // De zichtbare kop van het overzicht is leidend; de artikelpagina vult alleen aan.
+      title: item.weakTitle ? headline || item.title : item.title,
+      weakTitle: item.weakTitle && !headline,
       intro: description || item.intro || excerpt,
       image,
       content,
